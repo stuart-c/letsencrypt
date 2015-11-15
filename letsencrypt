@@ -1,0 +1,581 @@
+#!/usr/bin/env python2
+
+""" Let's Encrypt wrapper
+
+    Copyright (c) 2015, Stuart Clark; stuart.clark@Jahingo.com
+    See the documentation for further information on copyrights,
+    or contact the author. All Rights Reserved.
+"""
+
+import urlparse
+import subprocess
+import logging
+import StringIO
+import os
+import sys
+import os.path
+import platform
+import argparse
+import ConfigParser
+import datetime
+
+LETSENCRYPT_ACME_LIVE_URL = 'https://acme-v01.api.letsencrypt.org/directory'
+LETSENCRYPT_ACME_TEST_URL = ''
+
+DOCKER_IMAGE_OPENSSL_ARM = 'stuartc/armhf-openssl'
+DOCKER_IMAGE_OPENSSL_X86 = 'stuartc/openssl'
+
+DOCKER_IMAGE_LETSENCRYPT_ARM = 'stuartc/armhf-letsencrypt'
+DOCKER_IMAGE_LETSENCRYPT_X86 = 'quay.io/letsencrypt/letsencrypt'
+
+class CommandException(RuntimeError):
+    """Custom exception raised when an external command fails"""
+    pass
+
+def setup_logging(argv=None, parents=None):
+    """Check command line options for logging options and set logging level"""
+    if not parents:
+        parents = []
+
+    parser = argparse.ArgumentParser(add_help=False, parents=parents)
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--quiet', '-q', dest='verbosity', action='store_const',
+                       const=logging.ERROR, help='show less information')
+    group.add_argument('--verbose', '-v', dest='verbosity', action='store_const',
+                       const=logging.INFO, help='show more information')
+    group.add_argument('--debug', dest='verbosity', action='store_const',
+                       const=logging.DEBUG, help='show debugging information')
+
+    args, _ = parser.parse_known_args(argv)
+
+    if args.verbosity:
+        logging.getLogger().setLevel(args.verbosity)
+
+    return parser
+
+def read_config(argv=None, parents=None):
+    """Read configuration files specified on the command line as well as built-in defaults"""
+    if not parents:
+        parents = []
+
+    parser = argparse.ArgumentParser(add_help=False, parents=parents)
+
+    parser.add_argument('--config', '-c', action='append', metavar='FILE',
+                        type=argparse.FileType('r'), help='configuration file to load')
+
+    args, _ = parser.parse_known_args(argv)
+
+    files = []
+
+    for filename in ['/etc/letsencrypt.conf', os.path.expanduser('~/.letsencrypt.conf')]:
+        if os.path.isfile(filename) and os.access(filename, os.R_OK):
+            files.append(open(filename, 'r'))
+        else:
+            logging.info('File %s not found or readable', filename)
+
+    if args.config:
+        files.extend(args.config)
+
+    config = ConfigParser.RawConfigParser()
+    config.add_section('root')
+
+    for config_fp in files:
+        config.readfp(StringIO.StringIO('[root]\n' + config_fp.read()))
+        config_fp.close()
+
+    defaults = dict(config.items('root'))
+    logging.debug('config file contents: %s', defaults)
+
+    return parser, defaults
+
+def parse_args(argv=None):
+    """Parse all remaining command line options"""
+    logging_parser = setup_logging(argv)
+    config_parser, defaults = read_config(argv, [logging_parser])
+
+    parser = argparse.ArgumentParser(parents=[config_parser])
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--server', metavar='{URL,live,test}', default='test',
+                       help='which ACME server to use (default: %(default)s)')
+    group.add_argument('--live', dest='server', action='store_const', const='live',
+                       help='use Let''s Encrypt live ACME server')
+    group.add_argument('--test', dest='server', action='store_const', const='test',
+                       help='use Let''s Encrypt test ACME server')
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--webserver', choices=['auto', 'apache', 'nginx'], default='auto',
+                       help='webserver type (default: %(default)s)')
+    group.add_argument('--auto', dest='webserver', action='store_const', const='auto',
+                       help='autodetect webserver')
+    group.add_argument('--apache', dest='webserver', action='store_const', const='apache',
+                       help='webserver is Apache')
+    group.add_argument('--nginx', dest='webserver', action='store_const', const='nginx',
+                       help='webserver is nginx')
+    parser.add_argument('--container', metavar='NAME',
+                        help='webserver Docker container name')
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--after-update', dest='afterupdate', default='nothing',
+                       choices=['nothing', 'reload', 'restart'],
+                       help='what to do after an update (default: %(default)s)')
+    group.add_argument('--keep-running', dest='afterupdate', action='store_const', const='nothing',
+                       help='do nothing after an update')
+    group.add_argument('--reload', dest='afterupdate', action='store_const', const='reload',
+                       help='reload webserver after an update')
+    group.add_argument('--restart', dest='afterupdate', action='store_const', const='restart',
+                       help='restart webserver after an update')
+
+    parser.add_argument('--email', metavar='EMAIL',
+                        help='email address to send to ACME server')
+
+    parser.add_argument('--webroot', metavar='DIRECTORY', default='/var/www/html',
+                        help='webroot directory (default: %(default)s)')
+    parser.add_argument('--certificates', metavar='DIRECTORY', default='/etc/letsencrypt',
+                        help='certificate storage directory (default: %(default)s)')
+    parser.add_argument('--logs', metavar='DIRECTORY', default='/var/log/letsencrypt',
+                        help='logging directory (default: %(default)s)')
+    parser.add_argument('--openssl', metavar='COMMAND', default='openssl',
+                        help='openssl command to use (default: %(default)s)')
+    parser.add_argument('--docker', metavar='COMMAND', default='docker',
+                        help='docker command to use (default: %(default)s)')
+    parser.add_argument('--apachectl', metavar='COMMAND', default='apachectl',
+                        help='apachectl command to use (default: %(default)s)')
+    parser.add_argument('--nginxcmd', metavar='COMMAND', default='nginx',
+                        help='nginx command to use (default: %(default)s)')
+
+    parser.add_argument('--letsencrypt-image', dest='letsencryptimage', metavar='NAME',
+                        default='auto',
+                        help='Let''s Encrypt Docker image name (default: %(default)s)')
+    parser.add_argument('--openssl-image', dest='opensslimage', metavar='NAME',
+                        default='auto',
+                        help='OpenSSL Docker image name (default: %(default)s)')
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--issue', dest='mode', action='store_const', const='issue',
+                       help='issue new certificate (default)')
+    group.add_argument('--renew', dest='mode', action='store_const', const='renew',
+                       help='check for certificates to renew')
+
+    parser.add_argument('--renewal-days', dest='renewaldays', metavar='DAYS', type=int, default=30,
+                        help='days before expiry to renew (default: %(default)s)')
+
+    parser.add_argument('domain', nargs='*',
+                        help='domain names to issue certificate for (issue mode only)')
+
+    parser.set_defaults(mode='issue')
+
+    if defaults:
+        defaults.pop('renew', None)
+        defaults.pop('verbosity', None)
+        parser.set_defaults(**defaults)
+
+    args = parser.parse_args(argv)
+
+    logging.debug('parsed arguments: %s', args)
+    return args
+
+def parse_certificate(args, filepath):
+    """Parse a certificate file using OpenSSL to find domain details & expiry date"""
+    command = []
+
+    if args.opensslimage:
+        dirname = os.path.dirname(filepath)
+
+        command.extend(args.docker)
+        command.extend(['run', '--rm', '--volume', ':'.join([dirname, dirname])])
+        command.extend(args.opensslimage)
+    else:
+        command.extend(args.openssl)
+
+    command.extend(['x509', '-text', '-noout', '-in', filepath])
+
+    output = _command(command)
+
+    primary = None
+    domains = []
+    expiry = None
+
+    for line in output.split("\n"):
+        if ':' not in line:
+            continue
+
+        name, value = [string.strip() for string in line.strip().split(':', 1)]
+
+        if name == 'Subject':
+            _, primary = value.split('=', 1)
+        elif name == 'DNS':
+            domains.append(value)
+        elif name == 'Not After':
+            expiry = datetime.datetime.strptime(value.replace('  ', ' 0'), '%b %d %H:%M:%S %Y %Z')
+
+    return primary, expiry, domains
+
+def _command(command):
+    """Run an arbitrary external command and capture output"""
+    logging.debug('run command: %s', command)
+    try:
+        output = subprocess.check_output(command, stderr=subprocess.STDOUT)
+        logging.debug('command output: %s', output.strip())
+
+        return output.strip()
+    except OSError:
+        logging.debug('command returned OSError')
+        raise CommandException()
+    except subprocess.CalledProcessError as err:
+        logging.debug('command returned CalledProcessError: %i', err.returncode)
+        raise CommandException(err.output)
+
+def check_docker(args):
+    """Check Docker is working"""
+    return 'Storage Driver:' in _command(args.docker + ['info'])
+
+def check_openssl(args):
+    """Check OpenSSL is working"""
+    return 'OpenSSL' in _command(args.openssl + ['version'])
+
+def check_url(url):
+    """Check the specified URL is a valid HTTP/HTTPS location"""
+    result = urlparse.urlparse(url)
+
+    if result.scheme == 'http' or result.scheme == 'https':
+        return True
+
+    return False
+
+def check_arm():
+    """Check we are running on ARM"""
+    if 'arm' in platform.machine():
+        return True
+
+    if 'x86' not in platform.machine():
+        logging.critical('Only ARM and x86 platforms supported')
+        sys.exit(1)
+
+    return False
+
+def check_container(args):
+    """Check the specified container exists and is running"""
+    try:
+        output = _command(args.docker + ['inspect',
+                                         '--format="{{.State.Running}}"',
+                                         args.container])
+    except CommandException as err:
+        logging.error('docker inspect failed')
+        logging.info(err.args)
+        return False
+
+    return output == 'true'
+
+def check_image(args, image):
+    """Pull the specified image"""
+    try:
+        _command(args.docker + ['pull', image])
+    except CommandException as err:
+        logging.error('docker pull failed')
+        logging.info(err.args)
+        return False
+
+    return True
+
+def check_apache(args):
+    """Check the Apache control command is working"""
+    try:
+        output = _command(args.apachectl + ['status'])
+        return 'Apache' in output
+    except CommandException:
+        pass
+
+    return False
+
+def check_nginx(args):
+    """Check the nginx control command is working"""
+    try:
+        output = _command(args.nginxcmd + ['-v'])
+        return 'nginx version' in output
+    except CommandException:
+        pass
+
+    return False
+
+def detect_webserver(args):
+    """Detect which webserver is running locally or via Docker"""
+    detected = 'unknown'
+
+    if args.container:
+        if 'apache' in args.container.lower():
+            detected = 'apache'
+        elif 'nginx' in args.container.lower():
+            detected = 'nginx'
+        else:
+            try:
+                output = _command(args.docker + ['inspect',
+                                                 '--format="{{.Config.Image}}"',
+                                                 args.container])
+            except CommandException:
+                pass
+
+            if 'apache' in output.lower():
+                detected = 'apache'
+            elif 'nginx' in output.lower():
+                detected = 'nginx'
+
+    if detected == 'unknown':
+        if check_apache(args):
+            detected = 'apache'
+        elif check_nginx(args):
+            detected = 'nginx'
+
+    return detected
+
+def check_args(args): # pylint: disable=too-many-branches,too-many-statements
+    """Validate all parsed command line options"""
+    del args.config
+    del args.verbosity
+
+    args.docker = args.docker.split()
+    args.openssl = args.openssl.split()
+    args.apachectl = args.apachectl.split()
+    args.nginxcmd = args.nginxcmd.split()
+
+    if not check_docker(args):
+        logging.critical('Docker not available')
+        sys.exit(1)
+
+    if args.afterupdate != 'nothing':
+        if args.container and not check_container(args):
+            logging.critical('webserver Docker container not running')
+            sys.exit(1)
+
+        if args.webserver == 'auto':
+            args.webserver = detect_webserver(args)
+        if args.webserver == 'unknown':
+            logging.critical('cannot autodetect webserver type')
+            sys.exit(1)
+
+        if args.webserver == 'apache' and not check_apache(args):
+            logging.critical('apache webserver not detected')
+            sys.exit(1)
+        if args.webserver == 'nginx' and not check_nginx(args):
+            logging.critical('nginx webserver not detected')
+            sys.exit(1)
+
+    if args.server == 'live':
+        args.server = LETSENCRYPT_ACME_LIVE_URL
+    elif args.server == 'test':
+        args.server = LETSENCRYPT_ACME_TEST_URL
+    if args.server and not check_url(args.server):
+        logging.critical('valid ACME server URL is required')
+        sys.exit(1)
+
+    if not args.email or '@' not in args.email:
+        logging.critical('email address not valid')
+        sys.exit(1)
+
+    if not os.path.isdir(args.webroot):
+        logging.critical('webroot does not exist')
+        sys.exit(1)
+
+    if not os.path.isdir(args.certificates):
+        logging.warning('certificate storage directory does not exist')
+    if not os.path.isdir(args.logs):
+        logging.warning('logging directory does not exist')
+
+    if check_openssl(args):
+        args.opensslimage = ''
+    else:
+        logging.warning('OpenSSL not available, falling back to Docker image')
+
+        if args.opensslimage == 'auto':
+            if check_arm():
+                logging.info('using ARM OpenSSL Docker image')
+                args.opensslimage = DOCKER_IMAGE_OPENSSL_ARM
+            else:
+                logging.info('using x86 OpenSSL Docker image')
+                args.opensslimage = DOCKER_IMAGE_OPENSSL_X86
+
+        if not check_image(args, args.opensslimage):
+            logging.critical('OpenSSL docker image not available')
+            sys.exit(1)
+
+    if args.letsencryptimage == 'auto':
+        if check_arm():
+            logging.info('using ARM Let''s Encrypt Docker image')
+            args.letsencryptimage = DOCKER_IMAGE_LETSENCRYPT_ARM
+        else:
+            logging.info('using x86 Let''s Encrypt Docker image')
+            args.letsencryptimage = DOCKER_IMAGE_LETSENCRYPT_X86
+
+    if not check_image(args, args.letsencryptimage):
+        logging.critical('Let''s Encrypt docker image not available')
+        sys.exit(1)
+
+    if args.mode == 'renew' and args.domain:
+        logging.critical('domains not allowed in renew mode')
+        sys.exit(2)
+    if args.mode == 'issue' and not args.domain:
+        logging.critical('domains required in issue mode')
+        sys.exit(2)
+
+    logging.debug('checked arguments: %s', args)
+    return args
+
+def find_certificates(args):
+    """Find which previously issued certificates need renewing"""
+    renewals = []
+
+    live_path = os.path.join(args.certificates, 'live')
+
+    if not os.path.isdir(live_path):
+        logging.info('live certificates path does not exist: %s', live_path)
+        return
+
+    for dirname in os.listdir(live_path):
+        cert_dir = os.path.join(live_path, dirname)
+
+        if not os.path.isdir(cert_dir):
+            logging.debug('ignoring non-directory %s', cert_dir)
+            continue
+
+        cert_file = os.path.join(cert_dir, 'cert.pem')
+
+        if not os.path.isfile(cert_file):
+            logging.warning('cert.pem file not found in %s', dirname)
+            continue
+
+        if not os.access(cert_file, os.R_OK):
+            logging.warning('cert.pem file not readable in %s', dirname)
+
+        logging.debug('found certificate at %s', cert_file)
+
+        primary, expiry, domains = parse_certificate(args, cert_file)
+
+        days = (expiry - datetime.datetime.now()).days
+
+        logging.debug('primary domain: %s', primary)
+        logging.debug('subject alternative names: %s', ', '.join(domains))
+        logging.debug('expiry: %s [%i days]', expiry.isoformat(), days)
+
+        if days <= args.renewaldays:
+            logging.info('found certificate to renew: %s', primary)
+
+            try:
+                domains.remove(primary)
+            except ValueError:
+                pass
+
+            renewals.append([primary] + domains)
+
+    return renewals
+
+def issue_certificate(args, domains):
+    """Issue a new certificate"""
+    params = []
+
+    params.extend(['run', '--rm'])
+    params.extend(['--volume', args.logs + ':/var/log/letsencrypt'])
+    params.extend(['--volume', args.certificates + ':/etc/letsencrypt'])
+    params.extend(['--volume', args.webroot + ':/var/www/html'])
+    params.extend([args.letsencryptimage])
+    params.extend(['certonly'])
+
+    for domain in domains:
+        params.extend(['--domains', domain])
+
+    params.extend(['--email', args.email])
+    params.extend(['--authenticator', 'webroot'])
+    params.extend(['--webroot-path', '/var/www/html'])
+    params.extend(['--text', '--renew-by-default', '--agree-dev-preview', '--agree-tos'])
+
+    try:
+        _command(args.docker + params)
+    except CommandException as err:
+        logging.error('failed to issue certificate')
+        logging.info(err.args)
+        return False
+
+    return True
+
+def reload_webserver(args):
+    """Reload the webserver"""
+    if args.container:
+        signal = 'HUP'
+
+        if args.webserver == 'apache':
+            signal = 'USR1'
+
+        logging.info('reloading webserver within Docker container %s', args.container)
+        try:
+            _command(args.docker + ['kill', '--signal', signal, args.container])
+        except CommandException as err:
+            logging.error('failed to reload webserver Docker container')
+            logging.info(err.args)
+    elif args.webserver == 'apache':
+        logging.info('reloading Apache')
+        try:
+            _command(args.apachectl + ['graceful'])
+        except CommandException as err:
+            logging.warning('failed to reload')
+            logging.info(err.args)
+    elif args.webserver == 'nginx':
+        logging.info('reloading nginx')
+        try:
+            _command(args.nginxcmd + ['-s', 'reload'])
+        except CommandException as err:
+            logging.warning('failed to reload')
+            logging.info(err.args)
+
+def restart_webserver(args):
+    """Restart the webserver"""
+    if args.container:
+        logging.info('restarting Docker container %s', args.container)
+        try:
+            _command(args.docker + ['restart', args.container])
+        except CommandException as err:
+            logging.error('failed to restart webserver Docker container')
+            logging.info(err.args)
+    elif args.webserver == 'apache':
+        logging.info('restarting Apache')
+        try:
+            _command(args.apachectl + ['restart'])
+        except CommandException as err:
+            logging.warning('failed to restart')
+            logging.info(err.args)
+    elif args.webserver == 'nginx':
+        logging.info('can''t restart nginx')
+        reload_webserver(args)
+
+def main():
+    """Do everything"""
+    logging.basicConfig(format='%(levelname)s: %(message)s')
+
+    args = parse_args()
+    check_args(args)
+
+    if args.mode == 'renew':
+        domains_list = find_certificates(args)
+    else:
+        domains_list = [args.domain]
+
+    if domains_list:
+        logging.info('%i certificates to issue', len(domains_list))
+
+        update = False
+
+        for domains in domains_list:
+            if issue_certificate(args, domains):
+                logging.warning('certificate issued for %s', ', '.join(domains))
+                update = True
+
+        if not update:
+            logging.info('no certificates issued')
+        elif args.afterupdate == 'reload':
+            reload_webserver(args)
+        elif args.afterupdate == 'restart':
+            restart_webserver(args)
+    else:
+        logging.info('nothing to do')
+
+if __name__ == '__main__':
+    main()
