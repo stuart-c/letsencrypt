@@ -484,6 +484,9 @@ def issue_certificate(args, domains):
     for domain in domains:
         params.extend(['--domains', domain])
 
+    if args.server:
+        params.extend(['--server', args.server])
+
     params.extend(['--email', args.email])
     params.extend(['--authenticator', 'webroot'])
     params.extend(['--webroot-path', '/var/www/html'])
