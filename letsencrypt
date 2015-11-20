@@ -354,12 +354,13 @@ def check_args(args): # pylint: disable=too-many-branches,too-many-statements
             logging.critical('cannot autodetect webserver type')
             sys.exit(1)
 
-        if args.webserver == 'apache' and not check_apache(args):
-            logging.critical('apache webserver not detected')
-            sys.exit(1)
-        if args.webserver == 'nginx' and not check_nginx(args):
-            logging.critical('nginx webserver not detected')
-            sys.exit(1)
+        if not args.container:
+            if args.webserver == 'apache' and not check_apache(args):
+                logging.critical('apache webserver not detected')
+                sys.exit(1)
+            if args.webserver == 'nginx' and not check_nginx(args):
+                logging.critical('nginx webserver not detected')
+                sys.exit(1)
 
     if args.server == 'live':
         args.server = LETSENCRYPT_ACME_LIVE_URL
